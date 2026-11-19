@@ -40,50 +40,48 @@ until psql -qAtc 'SELECT 1' >/dev/null 2>&1; do
 done
 
 # 4. Install on the first start, run new migrations on later starts.
-#    Only one container installs at a time (a redeploy can overlap the old
-#    container): the one that creates railway_install_lock. The others wait for
-#    railway_install_done. If an install fails, the next start clears the
-#    unfinished database and installs again.
-q() { psql -qAtc "$1"; }
-has() { [ "$(q "SELECT to_regclass('$1') IS NOT NULL")" = t ]; }
-migrate() { console doctrine:migrations:migrate --allow-no-migration || exit 1; }
+#    A redeploy can start the new container while the old one still runs, so
+#    this step holds a Postgres advisory lock (in a background psql session,
+#    released when it ends or the container dies). wallabag's installer must
+#    see an empty database, so the lock adds no tables.
+q() { psql -qAt -v ON_ERROR_STOP=1 -c "$1"; }
+LOCK=27140001
+LOCKDIR=$(mktemp -d)
+mkfifo "$LOCKDIR/in"
+PGAPPNAME="wallabag-install-$$" psql -qAt -v ON_ERROR_STOP=1 < "$LOCKDIR/in" > /dev/null 2>&1 &
+LOCKPID=$!
+exec 3> "$LOCKDIR/in"
+echo "SELECT pg_advisory_lock($LOCK);" >&3
+i=0
+until [ "$(q "SELECT count(*) FROM pg_locks l JOIN pg_stat_activity a USING (pid) WHERE l.locktype = 'advisory' AND l.objid = $LOCK AND l.granted AND a.application_name = 'wallabag-install-$$'")" = 1 ]; do
+  kill -0 "$LOCKPID" 2>/dev/null || { echo "Could not take the install lock" >&2; exit 1; }
+  i=$((i + 1))
+  [ $((i % 15)) = 1 ] && echo "Waiting for another container to finish its install or migrations ..."
+  sleep 1
+done
 
-if has railway_install_done; then
-  migrate
-elif has "${P}user" && ! has railway_install_lock; then
-  # A database set up some other way (for example a restored dump).
-  migrate
-  q 'CREATE TABLE IF NOT EXISTS railway_install_done (at timestamptz DEFAULT now())'
+tables=$(q "SELECT count(*) FROM pg_tables WHERE schemaname = 'public'")
+settings=0
+if [ "$(q "SELECT to_regclass('${P}internal_setting') IS NOT NULL")" = t ]; then
+  settings=$(q "SELECT count(*) FROM ${P}internal_setting")
+fi
+case "$tables:$settings" in
+  *[!0-9:]*|:*|*:) echo "Could not read the database state" >&2; exit 1 ;;
+esac
+if [ "$settings" -gt 0 ]; then
+  console doctrine:migrations:migrate --allow-no-migration
 else
-  got=; i=0
-  while ! has railway_install_done; do
-    if psql -q -1 -c 'CREATE TABLE railway_install_lock (at timestamptz DEFAULT now())' \
-         -c 'INSERT INTO railway_install_lock DEFAULT VALUES' >/dev/null 2>&1; then
-      got=1; break
+  if [ "$tables" -gt 0 ]; then
+    # Tables but no settings: an earlier install stopped half way. Start over,
+    # unless the database holds saved articles.
+    if [ "$(q "SELECT to_regclass('${P}entry') IS NOT NULL")" = t ] && [ "$(q "SELECT count(*) FROM ${P}entry")" != 0 ]; then
+      echo "The database has articles but no wallabag settings; not touching it" >&2; exit 1
     fi
-    if [ "$(q "DELETE FROM railway_install_lock WHERE at < now() - interval '3 minutes' RETURNING 1" 2>/dev/null)" = 1 ]; then
-      echo "An earlier install did not finish: clearing the database and installing again"
-      psql -q -1 -v ON_ERROR_STOP=1 -c 'DROP SCHEMA public CASCADE' -c 'CREATE SCHEMA public' \
-        -c 'CREATE TABLE railway_install_lock (at timestamptz DEFAULT now())' \
-        -c 'INSERT INTO railway_install_lock DEFAULT VALUES' >/dev/null
-      got=1; break
-    fi
-    i=$((i + 1))
-    if [ "$i" -ge 300 ]; then echo "Gave up waiting for the install in another container" >&2; exit 1; fi
-    [ $((i % 10)) = 1 ] && echo "Waiting for the install in another container ..."
-    sleep 2
-  done
-  if [ -n "$got" ]; then
-    echo "Installing wallabag ..."
-    if ! console wallabag:install || ! has "${P}user"; then
-      echo "wallabag:install failed; the next start installs again" >&2
-      q "UPDATE railway_install_lock SET at = 'epoch'"
-      exit 1
-    fi
-    q 'CREATE TABLE railway_install_done (at timestamptz DEFAULT now())'
-  else
-    migrate
+    echo "An earlier install did not finish: clearing the database and installing again"
+    psql -q -v ON_ERROR_STOP=1 -c 'DROP SCHEMA public CASCADE' -c 'CREATE SCHEMA public' >/dev/null
   fi
+  echo "Installing wallabag ..."
+  console wallabag:install
 fi
 
 # 5. The installer always creates wallabag/wallabag. Turn it into our admin
@@ -104,6 +102,9 @@ UPDATE ${P}internal_setting SET value = '1' WHERE name = 'import_with_redis';
 SQL
   echo "Admin account ready: $ADMIN_USERNAME"
 fi
+exec 3>&-
+wait "$LOCKPID" || true
+rm -r "$LOCKDIR"
 
 # 6. Warm the cache, then run nginx, PHP-FPM and the import worker.
 console cache:warmup >/dev/null
