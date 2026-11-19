@@ -39,29 +39,51 @@ until psql -qAtc 'SELECT 1' >/dev/null 2>&1; do
   sleep 2
 done
 
-# 4. First start: install. Later starts: run any new migrations.
-#    Only one container installs: whoever creates the lock table first. Any
-#    other container (an overlapping deploy) waits until the install is done.
-installed() { [ "$(psql -qAtc "SELECT count(*) FROM pg_tables WHERE tablename = 'railway_install_done'")" = 1 ]; }
-if ! installed && [ "$(psql -qAtc "SELECT to_regclass('${P}user') IS NOT NULL")" != t ] \
-   && psql -qc 'CREATE TABLE railway_install_lock (id int)' >/dev/null 2>&1; then
-  echo "Installing wallabag ..."
-  console wallabag:install
-  psql -qc 'CREATE TABLE railway_install_done (id int)' >/dev/null
+# 4. Install on the first start, run new migrations on later starts.
+#    Only one container installs at a time (a redeploy can overlap the old
+#    container): the one that creates railway_install_lock. The others wait for
+#    railway_install_done. If an install fails, the next start clears the
+#    unfinished database and installs again.
+q() { psql -qAtc "$1"; }
+has() { [ "$(q "SELECT to_regclass('$1') IS NOT NULL")" = t ]; }
+migrate() { console doctrine:migrations:migrate --allow-no-migration || exit 1; }
+
+if has railway_install_done; then
+  migrate
+elif has "${P}user" && ! has railway_install_lock; then
+  # A database set up some other way (for example a restored dump).
+  migrate
+  q 'CREATE TABLE IF NOT EXISTS railway_install_done (at timestamptz DEFAULT now())'
 else
-  i=0
-  until installed || [ "$(psql -qAtc "SELECT to_regclass('railway_install_lock') IS NULL AND to_regclass('${P}user') IS NOT NULL")" = t ]; do
-    i=$((i + 1))
-    if [ "$i" -ge 150 ]; then
-      # The installing container died: clear its lock so the next start retries.
-      echo "Another container's install did not finish; retrying on the next start" >&2
-      psql -qc 'DROP TABLE IF EXISTS railway_install_lock' >/dev/null
-      exit 1
+  got=; i=0
+  while ! has railway_install_done; do
+    if psql -q -1 -c 'CREATE TABLE railway_install_lock (at timestamptz DEFAULT now())' \
+         -c 'INSERT INTO railway_install_lock DEFAULT VALUES' >/dev/null 2>&1; then
+      got=1; break
     fi
-    echo "Waiting for the install in another container ..."
+    if [ "$(q "DELETE FROM railway_install_lock WHERE at < now() - interval '3 minutes' RETURNING 1" 2>/dev/null)" = 1 ]; then
+      echo "An earlier install did not finish: clearing the database and installing again"
+      psql -q -1 -v ON_ERROR_STOP=1 -c 'DROP SCHEMA public CASCADE' -c 'CREATE SCHEMA public' \
+        -c 'CREATE TABLE railway_install_lock (at timestamptz DEFAULT now())' \
+        -c 'INSERT INTO railway_install_lock DEFAULT VALUES' >/dev/null
+      got=1; break
+    fi
+    i=$((i + 1))
+    if [ "$i" -ge 300 ]; then echo "Gave up waiting for the install in another container" >&2; exit 1; fi
+    [ $((i % 10)) = 1 ] && echo "Waiting for the install in another container ..."
     sleep 2
   done
-  console doctrine:migrations:migrate --allow-no-migration
+  if [ -n "$got" ]; then
+    echo "Installing wallabag ..."
+    if ! console wallabag:install || ! has "${P}user"; then
+      echo "wallabag:install failed; the next start installs again" >&2
+      q "UPDATE railway_install_lock SET at = 'epoch'"
+      exit 1
+    fi
+    q 'CREATE TABLE railway_install_done (at timestamptz DEFAULT now())'
+  else
+    migrate
+  fi
 fi
 
 # 5. The installer always creates wallabag/wallabag. Turn it into our admin
@@ -69,7 +91,7 @@ fi
 #    imports through Redis.
 if [ "$(psql -qAtc "SELECT count(*) FROM ${P}user WHERE username_canonical = 'wallabag' AND email_canonical = 'wallabag@wallabag.io'")" = 1 ]; then
   if [ -z "${ADMIN_PASSWORD:-}" ]; then echo "ADMIN_PASSWORD is empty" >&2; exit 1; fi
-  console fos:user:change-password wallabag "$ADMIN_PASSWORD"
+  console fos:user:change-password wallabag "$ADMIN_PASSWORD" || exit 1
   psql -q -v ON_ERROR_STOP=1 -v u="$ADMIN_USERNAME" -v e="$ADMIN_EMAIL" <<SQL
 UPDATE ${P}user SET username = :'u', username_canonical = lower(:'u'), email = :'e', email_canonical = lower(:'e')
  WHERE username_canonical = 'wallabag' AND email_canonical = 'wallabag@wallabag.io'
