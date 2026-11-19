@@ -47,13 +47,15 @@ done
 q() { psql -qAt -v ON_ERROR_STOP=1 -c "$1"; }
 LOCK=27140001
 LOCKDIR=$(mktemp -d)
+# A random session name: $$ is 1 in every container.
+LOCKNAME="wallabag-install-$(od -An -N8 -tx1 /dev/urandom | tr -d ' \n')"
 mkfifo "$LOCKDIR/in"
-PGAPPNAME="wallabag-install-$$" psql -qAt -v ON_ERROR_STOP=1 < "$LOCKDIR/in" > /dev/null 2>&1 &
+PGAPPNAME="$LOCKNAME" psql -qAt -v ON_ERROR_STOP=1 < "$LOCKDIR/in" > /dev/null 2>&1 &
 LOCKPID=$!
 exec 3> "$LOCKDIR/in"
 echo "SELECT pg_advisory_lock($LOCK);" >&3
 i=0
-until [ "$(q "SELECT count(*) FROM pg_locks l JOIN pg_stat_activity a USING (pid) WHERE l.locktype = 'advisory' AND l.objid = $LOCK AND l.granted AND a.application_name = 'wallabag-install-$$'")" = 1 ]; do
+until [ "$(q "SELECT count(*) FROM pg_locks l JOIN pg_stat_activity a USING (pid) WHERE l.locktype = 'advisory' AND l.objid = $LOCK AND l.granted AND a.application_name = '$LOCKNAME'")" = 1 ]; do
   kill -0 "$LOCKPID" 2>/dev/null || { echo "Could not take the install lock" >&2; exit 1; }
   i=$((i + 1))
   [ $((i % 15)) = 1 ] && echo "Waiting for another container to finish its install or migrations ..."
