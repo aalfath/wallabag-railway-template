@@ -1,0 +1,32 @@
+# Local test of the Railway template: the same services and variables.
+services:
+  wallabag:
+    build: .
+    ports: ["8080:80"]
+    environment:
+      SYMFONY__ENV__DATABASE_HOST: postgres
+      SYMFONY__ENV__DATABASE_PORT: "5432"
+      SYMFONY__ENV__DATABASE_NAME: railway
+      SYMFONY__ENV__DATABASE_USER: postgres
+      SYMFONY__ENV__DATABASE_PASSWORD: local-test-only
+      SYMFONY__ENV__REDIS_HOST: redis
+      SYMFONY__ENV__REDIS_PORT: "6379"
+      SYMFONY__ENV__REDIS_PASSWORD: local-test-only
+      SYMFONY__ENV__DOMAIN_NAME: http://localhost:8080
+      SYMFONY__ENV__SECRET: local-test-only-secret
+      ADMIN_USERNAME: admin
+      ADMIN_PASSWORD: local-test-only
+    volumes: ["wallabag-data:/data"]
+    depends_on: [postgres, redis]
+  postgres:
+    image: postgres:18
+    environment:
+      POSTGRES_DB: railway
+      POSTGRES_PASSWORD: local-test-only
+    volumes: ["pg-data:/var/lib/postgresql"]
+  redis:
+    image: redis:8
+    command: ["redis-server", "--requirepass", "local-test-only"]
+volumes:
+  wallabag-data:
+  pg-data:

@@ -1,0 +1,4 @@
+#!/bin/sh
+# Redis import worker (Pocket, Instapaper, Omnivore, browser and wallabag imports).
+cd /var/www/wallabag
+exec s6-setuidgid nobody php /usr/local/share/wallabag-railway/import-worker.php
