@@ -108,7 +108,9 @@ exec 3>&-
 wait "$LOCKPID" || true
 rm -r "$LOCKDIR"
 
-# 6. Warm the cache, then run nginx, PHP-FPM and the import worker.
+# 6. Rebuild the cache (it also caches internal settings), then run nginx,
+#    PHP-FPM and the import worker.
+rm -rf var/cache/*
 console cache:warmup >/dev/null
 echo "wallabag is ready on port $PORT"
 exec s6-svscan /etc/s6
